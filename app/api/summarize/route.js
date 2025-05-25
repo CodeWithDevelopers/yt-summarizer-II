@@ -1,20 +1,11 @@
-const { connectToDatabase } = require('@/lib/mongodb');
-const { NextResponse } = require('next/server');
-const { YoutubeTranscript } = require('youtube-transcript');
-const { extractVideoId, createSummaryPrompt } = require('@/lib/youtube');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const Groq = require('groq-sdk');
-const OpenAI = require('openai');
-const ytdl = require('ytdl-core');
-const fs = require('fs').promises;
-const path = require('path');
-const { exec } = require('child_process');
-const { promisify } = require('util');
-const FormData = require('form-data');
-const fetch = require('node-fetch');
-const { ObjectId } = require('mongodb');
-
-const execAsync = promisify(exec);
+import { NextResponse } from 'next/server';
+import { YoutubeTranscript } from 'youtube-transcript';
+import { extractVideoId, createSummaryPrompt } from '@/lib/youtube';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Groq } from 'groq-sdk';
+import { getOpenAIClient } from '@/lib/openai';
+import ytdl from 'ytdl-core';
+import { connectToDatabase } from '@/lib/mongodb';
 
 // Logger
 const logger = {
@@ -35,26 +26,6 @@ const logger = {
     console.debug(`[DEBUG] ${message}`, data ? JSON.stringify(data, null, 2) : '');
   },
 };
-
-// Initialize API clients
-function getGeminiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-  const genAI = new GoogleGenerativeAI(apiKey);
-  return genAI;
-}
-
-function getGroqClient() {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) return null;
-  return new Groq({ apiKey });
-}
-
-function getOpenAIClient() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return null;
-  return new OpenAI({ apiKey });
-}
 
 // Model names
 const MODEL_NAMES = {
@@ -101,11 +72,12 @@ const AI_MODELS = {
   gemini: {
     name: 'gemini',
     async generateContent(prompt) {
-      const genAI = getGeminiClient();
-      if (!genAI) {
-        throw new Error(`${MODEL_NAMES.gemini} API key is not configured. Please add your API key in the settings or choose a different model.`);
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error(`${MODEL_NAMES.gemini} API key is not configured.`);
       }
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-001' });
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
       const result = await model.generateContent(prompt);
       const response = await result.response;
       return cleanModelOutput(response.text());
@@ -113,12 +85,13 @@ const AI_MODELS = {
   },
   groq: {
     name: 'groq',
-    model: 'llama-3.3-70b-versatile',
+    model: 'llama3-70b-8192',
     async generateContent(prompt) {
-      const groq = getGroqClient();
-      if (!groq) {
-        throw new Error(`${MODEL_NAMES.groq} API key is not configured. Please add your API key in the settings or choose a different model.`);
+      const apiKey = process.env.GROQ_API_KEY;
+      if (!apiKey) {
+        throw new Error(`${MODEL_NAMES.groq} API key is not configured.`);
       }
+      const groq = new Groq({ apiKey });
       const completion = await groq.chat.completions.create({
         messages: [
           {
@@ -140,7 +113,7 @@ const AI_MODELS = {
     async generateContent(prompt) {
       const openai = getOpenAIClient();
       if (!openai) {
-        throw new Error(`${MODEL_NAMES.gpt4} API key is not configured. Please add your API key in the settings or choose a different model.`);
+        throw new Error(`${MODEL_NAMES.gpt4} API key is not configured.`);
       }
       const completion = await openai.chat.completions.create({
         messages: [
@@ -183,106 +156,6 @@ async function splitTranscriptIntoChunks(transcript, chunkSize = 7000, overlap =
   return chunks;
 }
 
-async function downloadAudio(videoId) {
-  const tempPath = path.join('/tmp', `${videoId}_temp.mp3`);
-  const outputPath = path.join('/tmp', `${videoId}.flac`);
-
-  try {
-    logger.info(`Starting audio download for video ${videoId}`);
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    logger.debug(`Downloading from URL: ${videoUrl}`);
-
-    const info = await ytdl.getInfo(videoUrl);
-    logger.info('Video info retrieved:', {
-      title: info.videoDetails.title,
-      duration: info.videoDetails.lengthSeconds,
-    });
-
-    const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-    const format = audioFormats.sort((a, b) => {
-      if (a.codecs?.includes('opus') && !b.codecs?.includes('opus')) return -1;
-      if (!a.codecs?.includes('opus') && b.codecs?.includes('opus')) return 1;
-      return (b.audioBitrate || 0) - (a.audioBitrate || 0);
-    })[0];
-
-    if (!format) {
-      throw new Error('No suitable audio format found');
-    }
-
-    logger.info('Selected audio format:', {
-      container: format.container,
-      codec: format.codecs,
-      quality: format.quality,
-      bitrate: format.audioBitrate,
-    });
-
-    await new Promise((resolve, reject) => {
-      const stream = ytdl.downloadFromInfo(info, { format });
-      const writeStream = require('fs').createWriteStream(tempPath);
-      stream.pipe(writeStream)
-        .on('finish', resolve)
-        .on('error', reject);
-    });
-
-    const tempStats = await fs.stat(tempPath);
-    if (tempStats.size === 0) {
-      throw new Error('Downloaded audio file is empty');
-    }
-    logger.info('Temp file verification:', { size: tempStats.size, path: tempPath });
-
-    logger.info('Converting audio to FLAC format...');
-    const { stdout, stderr } = await execAsync(`ffmpeg -i ${tempPath} -ar 16000 -ac 1 -c:a flac ${outputPath}`);
-    logger.debug('FFmpeg output:', { stdout, stderr });
-
-    const stats = await fs.stat(outputPath);
-    if (stats.size === 0) {
-      throw new Error('Converted FLAC file is empty');
-    }
-    logger.info('Audio conversion completed successfully:', {
-      inputSize: tempStats.size,
-      outputSize: stats.size,
-      outputPath,
-    });
-
-    await fs.unlink(tempPath);
-    logger.info('Temporary MP3 file cleaned up');
-
-    return outputPath;
-  } catch (error) {
-    logger.error('Error in downloadAudio:', { error, videoId, tempPath, outputPath });
-    if (await fs.exists(tempPath)) await fs.unlink(tempPath).catch(e => logger.error('Failed to cleanup temp MP3:', e));
-    if (await fs.exists(outputPath)) await fs.unlink(outputPath).catch(e => logger.error('Failed to cleanup FLAC:', e));
-    throw error;
-  }
-}
-
-async function transcribeWithWhisper(audioPath) {
-  try {
-    logger.info('Starting transcription process with OpenAI Whisper');
-    const inputStats = await fs.stat(audioPath);
-    logger.debug('Input file details:', { size: inputStats.size, path: audioPath });
-
-    const openai = getOpenAIClient();
-    if (!openai) {
-      throw new Error('OpenAI API key not configured for Whisper transcription.');
-    }
-
-    const audioBuffer = await fs.readFile(audioPath);
-    logger.info(`Read audio file of size: ${audioBuffer.length} bytes`);
-
-    const transcription = await openai.audio.transcriptions.create({
-      file: new File([audioBuffer], 'audio.flac', { type: 'audio/flac' }),
-      model: 'whisper-1',
-      language: 'auto',
-    });
-
-    logger.info('Successfully received transcription from Whisper');
-    return transcription.text;
-  } finally {
-    await fs.unlink(audioPath).catch(error => logger.error('Failed to delete temporary audio file:', error));
-  }
-}
-
 async function getTranscript(videoId) {
   try {
     logger.info(`Attempting to fetch YouTube transcript for video ${videoId}`);
@@ -311,7 +184,7 @@ async function getTranscript(videoId) {
       title,
     };
   } catch (error) {
-    logger.info('YouTube transcript not available, falling back to Whisper...', { error });
+    logger.info('YouTube transcript not available, falling back to video info...');
     const videoInfo = await ytdl.getInfo(videoId);
     const title = videoInfo.videoDetails.title;
 
@@ -321,24 +194,15 @@ async function getTranscript(videoId) {
       author: videoInfo.videoDetails.author.name,
     });
 
-    const openai = getOpenAIClient();
-    if (!openai) {
-      throw new Error('Transcript not available and OpenAI API key not configured for Whisper fallback.');
-    }
-
-    const audioPath = await downloadAudio(videoId);
-    const transcript = await transcribeWithWhisper(audioPath);
-
-    logger.info('Transcription completed successfully', { transcriptLength: transcript.length });
-    return { transcript, source: 'whisper', title };
+    throw new Error('Transcript not available and Whisper fallback is disabled.');
   }
 }
 
-async function GET(req) {
+export async function GET() {
   return NextResponse.json(checkApiKeyAvailability());
 }
 
-async function POST(req) {
+export async function POST(request) {
   const encoder = new TextEncoder();
   const stream = new TransformStream();
   const writer = stream.writable.getWriter();
@@ -349,7 +213,7 @@ async function POST(req) {
 
   (async () => {
     try {
-      const { url, language, mode, aiModel = 'gemini' } = await req.json();
+      const { url, language, mode, aiModel = 'gemini' } = await request.json();
       const videoId = extractVideoId(url);
 
       logger.info('Processing video request', { videoId, language, mode, aiModel });
@@ -500,5 +364,3 @@ async function POST(req) {
     },
   });
 }
-
-module.exports = { GET, POST };
